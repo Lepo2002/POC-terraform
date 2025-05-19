@@ -1,0 +1,8 @@
+gcp_project_id         = "module-test-project-123456"
+gcp_region             = "europe-west1"
+gcp_service_account    = "test-sa@module-test-project-123456.iam.gserviceaccount.com"
+azure_region           = "westeurope"
+azure_tenant_id        = "00000000-0000-0000-0000-000000000000"
+azure_object_id        = "00000000-0000-0000-0000-000000000000"
+security_contact_email = "security@example.com"
+security_contact_phone = "+123456789"

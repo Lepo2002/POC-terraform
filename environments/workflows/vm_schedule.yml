@@ -1,0 +1,220 @@
+name: VM Power Management
+
+on:
+  schedule:
+
+    - cron: '0 8 * * 1-5'
+
+    - cron: '0 22 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'status'
+        type: choice
+        options:
+          - start
+          - stop
+          - status
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - testing
+          - module_test_environments
+
+jobs:
+  manage-vms:
+    name: Manage Virtual Machines
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          export_default_credentials: true
+
+      - name: Set up Azure CLI
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          
+      - name: Determine Action
+        id: determine-action
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ACTION="${{ github.event.inputs.action }}"
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          else
+            HOUR=$(date +%H)
+            if [ $HOUR -eq 8 ]; then
+              ACTION="start"
+              echo "⏰ Auto-starting VMs at 8 AM"
+            elif [ $HOUR -eq 22 ]; then
+              ACTION="stop"
+              echo "⏰ Auto-stopping VMs at 10 PM"
+            else
+              ACTION="status"
+              echo "⚠️ Running at unexpected time, just checking status"
+            fi
+            ENVIRONMENT="development,testing"
+          fi
+          echo "action=${ACTION}" >> $GITHUB_OUTPUT
+          echo "environment=${ENVIRONMENT}" >> $GITHUB_OUTPUT
+
+      - name: List GCP VMs
+        id: list-gcp-vms
+        run: |
+          IFS=',' read -ra ENVS <<< "${{ steps.determine-action.outputs.environment }}"
+          
+          echo "GCP Virtual Machines:"
+          echo "---------------------"
+          
+          for ENV in "${ENVS[@]}"; do
+            echo "Environment: $ENV"
+
+            if [ "$ENV" == "development" ]; then
+              PROJECT_ID="${{ secrets.GCP_DEV_PROJECT_ID }}"
+            elif [ "$ENV" == "testing" ]; then
+              PROJECT_ID="${{ secrets.GCP_TEST_PROJECT_ID }}"
+            elif [ "$ENV" == "module_test_environments" ]; then
+              PROJECT_ID="${{ secrets.GCP_MODULE_TEST_PROJECT_ID }}"
+            else
+              echo "Unknown environment: $ENV, skipping..."
+              continue
+            fi
+            
+            echo "Getting VM instances for project $PROJECT_ID..."
+            gcloud compute instances list --project=$PROJECT_ID --format="table(name,zone,status)"
+            echo ""
+          done
+
+      - name: List Azure VMs
+        id: list-azure-vms
+        run: |
+          IFS=',' read -ra ENVS <<< "${{ steps.determine-action.outputs.environment }}"
+          
+          echo "Azure Virtual Machines:"
+          echo "----------------------"
+          
+          for ENV in "${ENVS[@]}"; do
+            echo "Environment: $ENV"
+            
+            if [ "$ENV" == "development" ]; then
+              RESOURCE_GROUP="dev-saas-multicloud-rg"
+            elif [ "$ENV" == "testing" ]; then
+              RESOURCE_GROUP="test-saas-multicloud-rg"
+            elif [ "$ENV" == "module_test_environments" ]; then
+              RESOURCE_GROUP="modtest-saas-multicloud-rg"
+            else
+              echo "Unknown environment: $ENV, skipping..."
+              continue
+            fi
+            
+            echo "Getting VM instances for resource group $RESOURCE_GROUP..."
+            az vm list -g $RESOURCE_GROUP -o table --query "[].{Name:name, ResourceGroup:resourceGroup, PowerState:powerState}"
+            echo ""
+          done
+
+      - name: Manage GCP VMs
+        if: steps.determine-action.outputs.action == 'start' || steps.determine-action.outputs.action == 'stop'
+        run: |
+          ACTION="${{ steps.determine-action.outputs.action }}"
+          
+          IFS=',' read -ra ENVS <<< "${{ steps.determine-action.outputs.environment }}"
+          
+          for ENV in "${ENVS[@]}"; do
+            echo "Environment: $ENV"
+
+            if [ "$ENV" == "development" ]; then
+              PROJECT_ID="${{ secrets.GCP_DEV_PROJECT_ID }}"
+            elif [ "$ENV" == "testing" ]; then
+              PROJECT_ID="${{ secrets.GCP_TEST_PROJECT_ID }}"
+            elif [ "$ENV" == "module_test_environments" ]; then
+              PROJECT_ID="${{ secrets.GCP_MODULE_TEST_PROJECT_ID }}"
+            else
+              echo "Unknown environment: $ENV, skipping..."
+              continue
+            fi
+            
+            echo "Getting VMs for project $PROJECT_ID..."
+            VM_LIST=$(gcloud compute instances list --project=$PROJECT_ID --format="csv[no-heading](name,zone)" | grep -v "gke\|bastion")
+            
+            if [ -z "$VM_LIST" ]; then
+              echo "No eligible VMs found in $ENV"
+              continue
+            fi
+            
+            echo "Found VMs: $VM_LIST"
+
+            echo "$VM_LIST" | while IFS=, read VM_NAME VM_ZONE; do
+              if [ "$ACTION" == "start" ]; then
+                echo "Starting VM: $VM_NAME in zone $VM_ZONE"
+                gcloud compute instances start $VM_NAME --zone=$VM_ZONE --project=$PROJECT_ID
+              elif [ "$ACTION" == "stop" ]; then
+                echo "Stopping VM: $VM_NAME in zone $VM_ZONE"
+                gcloud compute instances stop $VM_NAME --zone=$VM_ZONE --project=$PROJECT_ID
+              fi
+            done
+          done
+
+      - name: Manage Azure VMs
+        if: steps.determine-action.outputs.action == 'start' || steps.determine-action.outputs.action == 'stop'
+        run: |
+          ACTION="${{ steps.determine-action.outputs.action }}"
+          
+          IFS=',' read -ra ENVS <<< "${{ steps.determine-action.outputs.environment }}"
+          
+          for ENV in "${ENVS[@]}"; do
+            echo "Environment: $ENV"
+            
+            if [ "$ENV" == "development" ]; then
+              RESOURCE_GROUP="dev-saas-multicloud-rg"
+            elif [ "$ENV" == "testing" ]; then
+              RESOURCE_GROUP="test-saas-multicloud-rg"
+            elif [ "$ENV" == "module_test_environments" ]; then
+              RESOURCE_GROUP="modtest-saas-multicloud-rg"
+            else
+              echo "Unknown environment: $ENV, skipping..."
+              continue
+            fi
+            
+            echo "Getting VMs for resource group $RESOURCE_GROUP..."
+            VM_LIST=$(az vm list -g $RESOURCE_GROUP --query "[?!contains(name, 'aks') && !contains(name, 'bastion')].name" -o tsv)
+            
+            if [ -z "$VM_LIST" ]; then
+              echo "No eligible VMs found in $ENV"
+              continue
+            fi
+            
+            echo "Found VMs: $VM_LIST"
+            
+            for VM_NAME in $VM_LIST; do
+              if [ "$ACTION" == "start" ]; then
+                echo "Starting VM: $VM_NAME"
+                az vm start -g $RESOURCE_GROUP -n $VM_NAME
+              elif [ "$ACTION" == "stop" ]; then
+                echo "Stopping VM: $VM_NAME"
+                az vm deallocate -g $RESOURCE_GROUP -n $VM_NAME
+              fi
+            done
+          done
+
+      - name: Send Notification
+        if: steps.determine-action.outputs.action == 'start' || steps.determine-action.outputs.action == 'stop'
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: ${{ steps.determine-action.outputs.action == 'start' && 'good' || 'warning' }}
+          SLACK_ICON: ${{ steps.determine-action.outputs.action == 'start' && '🟢' || '🔴' }}
+          SLACK_TITLE: "VM Power Management"
+          SLACK_MESSAGE: "Operation: ${{ steps.determine-action.outputs.action == 'start' && 'Started' || 'Stopped' }} VMs in environment(s): ${{ steps.determine-action.outputs.environment }}"

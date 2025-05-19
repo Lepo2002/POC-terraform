@@ -1,0 +1,132 @@
+name: Pull Request Validation
+
+on:
+  pull_request:
+    branches: [ main, development ]
+    paths:
+      - '**/*.tf'
+      - '**/*.tfvars'
+      - '.github/workflows/pr_validation.yml'
+
+jobs:
+  terraform-validate:
+    name: Validate Terraform Configuration
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [development, testing, production, DR]
+        
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.0.0
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        run: |
+          cd environments/${{ matrix.environment }}
+          terraform init -backend=false
+
+      - name: Terraform Validate
+        id: validate
+        run: |
+          cd environments/${{ matrix.environment }}
+          terraform validate
+
+      - name: Check Module Tests
+        if: matrix.environment == 'development'
+        run: |
+          cd environments/module_test_environments
+          find . -maxdepth 1 -type d -not -path . | while read module_dir; do
+            cd $module_dir
+            echo "Validating module test: $module_dir"
+            terraform init -backend=false
+            terraform validate
+            cd ../
+          done
+
+      - name: Comment on PR
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Format and Style 🖌 \`${{ steps.fmt.outcome }}\`
+            #### Terraform Validation 🤖 \`${{ steps.validate.outcome }}\`
+            
+            *Environment: ${{ matrix.environment }}*
+            
+            <details><summary>Show Validation Output</summary>
+            
+            \`\`\`
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+            
+            </details>`;
+              
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  tfsec:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@master
+        with:
+          additional_args: --exclude-path=environments/module_test_environments
+
+      - name: Publish tfsec scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: tfsec.sarif
+          
+  check-cost:
+    name: Cost Estimation
+    runs-on: ubuntu-latest
+    needs: terraform-validate
+    if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.0.0
+
+      - name: Set up Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate Infracost cost estimation baseline
+        run: |
+          cd environments/production
+          infracost breakdown --path=. --format=json --out-file=/tmp/infracost-base.json
+
+      - name: Generate Infracost diff
+        run: |
+          cd environments/production
+          infracost diff --path=. --format=json --compare-to=/tmp/infracost-base.json --out-file=/tmp/infracost.json
+
+      - name: Post Infracost comment
+        uses: infracost/actions/comment@v2
+        with:
+          path: /tmp/infracost.json
+          behavior: update

@@ -1,0 +1,6 @@
+gcp_project_id            = "module-test-project-123456"
+gcp_region                = "europe-west1"
+azure_region              = "westeurope"
+database_admin_username   = "dbadmin"
+database_admin_password   = "REPLACE_WITH_SECURE_PASSWORD"
+database_readonly_password = "REPLACE_WITH_SECURE_PASSWORD"

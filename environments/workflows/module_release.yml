@@ -1,0 +1,174 @@
+name: Module Release
+
+on:
+  push:
+    branches:
+      - 'module-release/**'
+    paths:
+      - 'modules/**/*.tf'
+      - 'modules/**/*.md'
+  workflow_dispatch:
+    inputs:
+      module_path:
+        description: 'Path to the module (e.g. gcp_networking/v1)'
+        required: true
+        type: string
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        default: 'minor'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+jobs:
+  test-module:
+    name: Test Module
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.0.0
+
+      - name: Determine Module Path
+        id: module
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            MODULE_PATH="${{ github.event.inputs.module_path }}"
+          else
+
+            BRANCH_NAME="${{ github.ref_name }}"
+            MODULE_PATH=$(echo ${BRANCH_NAME} | sed 's/module-release\///')
+          fi
+          echo "module_path=${MODULE_PATH}" >> $GITHUB_OUTPUT
+          
+          MODULE_NAME=$(echo ${MODULE_PATH} | cut -d'/' -f1)
+          echo "module_name=${MODULE_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Terraform Format Check
+        run: |
+          cd modules/${{ steps.module.outputs.module_path }}
+          terraform fmt -check -recursive
+
+      - name: Run Module Test
+        run: |
+
+          cd environments/module_test_environments
+          TEST_DIR=$(find . -maxdepth 1 -type d -name "*${{ steps.module.outputs.module_name }}*" -o -name "*$(echo ${{ steps.module.outputs.module_name }} | sed 's/gcp_//; s/azure_//')*")
+          
+          if [ -z "$TEST_DIR" ]; then
+            echo "⚠️ No matching test directory found for module ${{ steps.module.outputs.module_name }}"
+            exit 0
+          fi
+          
+          echo "Running tests in $TEST_DIR"
+          cd $TEST_DIR
+          terraform init -backend=false
+          terraform validate
+
+      - name: Run tfsec on Module
+        uses: aquasecurity/tfsec-action@master
+        with:
+          additional_args: --include-path=modules/${{ steps.module.outputs.module_path }}
+
+  update-version:
+    name: Update Module Version
+    needs: test-module
+    runs-on: ubuntu-latest
+    if: success()
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.REPO_TOKEN }}
+
+      - name: Determine Module Path and Version
+        id: module
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            MODULE_PATH="${{ github.event.inputs.module_path }}"
+            VERSION_BUMP="${{ github.event.inputs.version_bump }}"
+          else
+
+            BRANCH_NAME="${{ github.ref_name }}"
+            MODULE_PATH=$(echo ${BRANCH_NAME} | sed 's/module-release\///')
+            VERSION_BUMP="minor"
+          fi
+          echo "module_path=${MODULE_PATH}" >> $GITHUB_OUTPUT
+          echo "version_bump=${VERSION_BUMP}" >> $GITHUB_OUTPUT
+
+          MODULE_NAME=$(echo ${MODULE_PATH} | cut -d'/' -f1)
+          echo "module_name=${MODULE_NAME}" >> $GITHUB_OUTPUT
+          
+          CURRENT_VERSION=$(echo ${MODULE_PATH} | cut -d'/' -f2)
+          echo "current_version=${CURRENT_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Bump Module Version
+        id: bump
+        run: |
+
+          chmod +x ./scripts/bump_module_version.sh
+          NEW_VERSION=$(./scripts/bump_module_version.sh ${{ steps.module.outputs.module_name }} ${{ steps.module.outputs.current_version }} ${{ steps.module.outputs.version_bump }})
+          echo "new_version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Update Version in versions.json
+        run: |
+
+          jq --arg module "${{ steps.module.outputs.module_name }}" --arg version "${{ steps.bump.outputs.new_version }}" \
+          '.latest[$module] = $version' environments/versions.json > environments/versions.json.new
+          mv environments/versions.json.new environments/versions.json
+          
+          jq --arg date "$(date +'%Y-%m-%d')" --arg user "${{ github.actor }}" \
+          --arg changes "Updated ${{ steps.module.outputs.module_name }} from ${{ steps.module.outputs.current_version }} to ${{ steps.bump.outputs.new_version }}" \
+          '.update_history = [{"date": $date, "user": $user, "changes": $changes}] + .update_history' \
+          environments/versions.json > environments/versions.json.new
+          mv environments/versions.json.new environments/versions.json
+          
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git add environments/versions.json
+          git commit -m "Update ${{ steps.module.outputs.module_name }} to version ${{ steps.bump.outputs.new_version }}"
+          git push
+
+      - name: Create Release Tag
+        run: |
+          TAG="module-${{ steps.module.outputs.module_name }}-${{ steps.bump.outputs.new_version }}"
+          git tag $TAG
+          git push origin $TAG
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: "module-${{ steps.module.outputs.module_name }}-${{ steps.bump.outputs.new_version }}"
+          release_name: "${{ steps.module.outputs.module_name }} ${{ steps.bump.outputs.new_version }}"
+          body: |
+            # ${{ steps.module.outputs.module_name }} ${{ steps.bump.outputs.new_version }}
+            
+            Module path: `modules/${{ steps.module.outputs.module_name }}/${{ steps.bump.outputs.new_version }}`
+            
+            ${{ github.event.head_commit.message }}
+            
+            Update your environment's module reference to use this new version:
+            
+            ```hcl
+            module "${{ steps.module.outputs.module_name }}" {
+              source = "../../modules/${{ steps.module.outputs.module_name }}/${{ steps.bump.outputs.new_version }}"
+            }
+            ```
+            
+            Or run the update script:
+            ```bash
+            ./scripts/update_environment_versions.sh development ${{ steps.module.outputs.module_name }} ${{ steps.bump.outputs.new_version }}
+            ```
+          draft: false
+          prerelease: false

@@ -1,0 +1,140 @@
+name: Environment Deployment
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'environments/**/*.tf'
+      - 'environments/**/*.tfvars'
+      - 'modules/**/*.tf'
+      - '.github/workflows/environment_deployment.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - testing
+          - production
+          - DR
+
+jobs:
+  determine-environment:
+    name: Determine Target Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+    steps:
+      - name: Set environment based on branch or manual input
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=development" >> $GITHUB_OUTPUT
+          fi
+
+  plan:
+    name: Terraform Plan
+    needs: determine-environment
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.0.0
+
+      - name: Terraform Init
+        id: init
+        run: |
+          cd environments/${{ needs.determine-environment.outputs.environment }}
+          terraform init -input=false
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd environments/${{ needs.determine-environment.outputs.environment }}
+          terraform plan -input=false -out=tfplan -var-file=terraform.tfvars
+        continue-on-error: true
+
+      - name: Upload Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan-${{ needs.determine-environment.outputs.environment }}
+          path: environments/${{ needs.determine-environment.outputs.environment }}/tfplan
+          retention-days: 7
+          
+      - name: Plan Status
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  apply:
+    name: Terraform Apply
+    needs: [determine-environment, plan]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.determine-environment.outputs.environment }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.0.0
+
+      - name: Request Approval for Production
+        if: needs.determine-environment.outputs.environment == 'production'
+        uses: trstringer/manual-approval@v1.8.0
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: your-github-username
+          minimum-approvals: 1
+          issue-title: "Approval needed for Production Deployment"
+          issue-body: "Please approve or deny the deployment to Production environment."
+
+      - name: Download Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan-${{ needs.determine-environment.outputs.environment }}
+          path: environments/${{ needs.determine-environment.outputs.environment }}
+
+      - name: Terraform Init
+        run: |
+          cd environments/${{ needs.determine-environment.outputs.environment }}
+          terraform init -input=false
+
+      - name: Terraform Apply
+        run: |
+          cd environments/${{ needs.determine-environment.outputs.environment }}
+          terraform apply -input=false tfplan
+
+      - name: Notify Slack on Success
+        if: success()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: good
+          SLACK_TITLE: Deployment Successful
+          SLACK_MESSAGE: "Deployment to ${{ needs.determine-environment.outputs.environment }} completed successfully"
+
+      - name: Notify Slack on Failure
+        if: failure()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: danger
+          SLACK_TITLE: Deployment Failed
+          SLACK_MESSAGE: "Deployment to ${{ needs.determine-environment.outputs.environment }} failed"

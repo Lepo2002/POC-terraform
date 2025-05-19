@@ -1,0 +1,7 @@
+gcp_project_id      = "module-test-project-123456"
+gcp_project_number  = "123456789012"
+gcp_region          = "europe-west1"
+azure_region        = "westeurope"
+azure_tenant_id     = "00000000-0000-0000-0000-000000000000"
+azure_subscription_id = "00000000-0000-0000-0000-000000000000"
+vpn_shared_secret   = "REPLACE_WITH_SECURE_SECRET"
